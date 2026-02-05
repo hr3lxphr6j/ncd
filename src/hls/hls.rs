@@ -6,13 +6,13 @@
 use crate::httpx;
 use aes::Aes128;
 use cbc::Decryptor;
-use cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
-use kdam::{BarExt, tqdm};
+use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use kdam::{tqdm, BarExt};
 use m3u8_rs;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -159,35 +159,31 @@ impl HLSDownloader {
         tx: &tokio_mpsc::Sender<Vec<u8>>,
         key: Option<&[u8; 16]>,
         iv: Option<&[u8; 16]>,
-        fragment_pb: Option<&mut kdam::Bar>,
+        fragment_pb: Option<Arc<Mutex<kdam::Bar>>>,
     ) -> Result<(), Error> {
         // セグメントを保存する一時ファイルを作成
         let tmp_file = tempfile::NamedTempFile::new()?;
         let tmp_path = tmp_file.path();
 
-        // セグメントをダウンロード（ライフタイムの問題のため、プログレスコールバックは使用しない）
-        // プログレスバーはダウンロード完了後に更新
-        let progress_cb: Option<Box<dyn Fn(usize, u64, u64) + Send + Sync>> = None;
+        // プログレスバーを Arc<Mutex<...>> にラップして、クロージャ内で更新可能にする
+        let progress: Option<&httpx::ProgressCallback> = if let Some(pb_arc) = fragment_pb {
+            // クロージャ内で使用するためにクローン
+            let pb_clone = Arc::clone(&pb_arc);
+            Some(&move |_, downloaded_size: u64, total_size: u64| {
+                if let Ok(mut pb) = pb_clone.lock() {
+                    if pb.total == 0 {
+                        pb.total = total_size as usize;
+                    }
+                    let _ = pb.update(downloaded_size as usize);
+                }
+            })
+        } else {
+            None
+        };
 
         self.hc
-            .download_with_retry(
-                &frag.uri.as_str(),
-                tmp_path,
-                true,
-                None,
-                progress_cb.as_deref(), // レジューム機能をサポート
-            )
+            .download_with_retry(&frag.uri.as_str(), tmp_path, true, None, progress)
             .await?;
-
-        // セグメントプログレスバーを更新（ダウンロード完了後）
-        if let Some(pb) = fragment_pb {
-            let file_size = tokio::fs::metadata(tmp_path).await?.len();
-            if pb.total == 0 && file_size > 0 {
-                pb.total = file_size as usize;
-            }
-            pb.update(file_size as usize).expect("TODO: panic message");
-            pb.refresh().expect("TODO: panic message");
-        }
 
         // ダウンロードしたファイルを読み取り
         let mut file = OpenOptions::new().read(true).open(tmp_path).await?;
@@ -293,7 +289,6 @@ impl HLSDownloader {
         let mut total_pb = tqdm!(
             total = pl.segments.len(),
             desc = "Total",
-            ncols = 80,
             position = 0,
             leave = true
         );
@@ -301,14 +296,14 @@ impl HLSDownloader {
         // ===== ステップ 6: すべてのセグメントを走査し、ダウンロード、復号化して送信 =====
         for (idx, f) in pl.segments.iter().enumerate() {
             // セグメントプログレスバーを作成：現在のセグメントのダウンロード進捗を表示
-            let mut fragment_pb = tqdm!(
+            let fragment_pb = tqdm!(
                 desc = format!("Fragment: {}", idx + 1),
                 unit = "B",
                 unit_scale = true,
-                ncols = 80,
                 position = 1,
                 leave = false
             );
+            let fragment_pb = Arc::new(Mutex::new(fragment_pb));
 
             // 現在のセグメントに独自のキーがあるか確認
             // セグメントに独自のキーがある場合、セグメントのキーを使用；それ以外はプレイリストレベルのキーを使用
@@ -347,10 +342,12 @@ impl HLSDownloader {
                 &tx,
                 seg_key.0.as_ref(),
                 seg_key.1.as_ref(),
-                Some(&mut fragment_pb),
+                Some(fragment_pb.clone()),
             )
             .await?;
-            fragment_pb.refresh().expect("TODO: panic message");
+            if let Ok(mut pb) = fragment_pb.lock() {
+                pb.refresh().expect("TODO: panic message");
+            }
             total_pb.update(1).expect("TODO: panic message");
         }
         total_pb.refresh().expect("TODO: panic message");

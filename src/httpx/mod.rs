@@ -1,3 +1,3 @@
 mod client;
 
-pub use client::{DownloadError, HttpXClient};
+pub use client::{DownloadError, HttpXClient, ProgressCallback, ReqBuilderCallback};

@@ -9,6 +9,8 @@ use ncd::nicochannel::client::{NicoChannelClient, NicoChannelError};
 use regex::Regex;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use tokio::signal;
 
 /// コマンドライン引数の定義
 #[derive(Parser, Debug)]
@@ -31,12 +33,93 @@ struct Args {
     urls: Vec<String>,
 }
 
+lazy_static::lazy_static! {
+    // グローバル状態：ダウンロード中のファイルを追跡
+    static ref DOWNLOADING_FILES: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+}
+
+async fn download(
+    nc: &mut NicoChannelClient,
+    args: &Args,
+    vid: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // ===== 単一の動画をダウンロード =====
+    // 出力ファイルパスを取得して登録
+    let output_file = {
+        let video_info = nc.video_info(vid).await?;
+        let title = video_info["title"]
+            .as_str()
+            .ok_or("Failed to get title from video info")?;
+        let content_code = video_info["content_code"]
+            .as_str()
+            .ok_or("Failed to get content_code from video info")?;
+        args.output_dir.join(format!(
+            "{}.mkv",
+            NicoChannelClient::output_filename(title, content_code)
+        ))
+    };
+
+    // ファイルパスを登録
+    {
+        let mut files = DOWNLOADING_FILES.lock()?;
+        files.push(output_file.clone());
+    }
+
+    // ダウンロード実行
+    let result = nc.download_video(vid, &args.output_dir).await;
+
+    // ファイルパスを登録から削除
+    {
+        let mut files = DOWNLOADING_FILES.lock()?;
+        files.retain(|f| f != &output_file);
+    }
+
+    result
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ログシステムを初期化
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .init();
+
+    // シグナルハンドラーを設定：Ctrl+C (SIGINT) と SIGTERM を監視
+    let downloading_files = Arc::clone(&DOWNLOADING_FILES);
+    tokio::spawn(async move {
+        let ctrl_c = async {
+            signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
+        }
+
+        // シグナルを受信したら、ダウンロード中のファイルを削除
+        let files = downloading_files.lock().unwrap();
+        for file in files.iter() {
+            if file.exists() {
+                let _ = std::fs::remove_file(file).inspect_err(|e| {
+                    error!("failed to remove file: {:?}", e);
+                });
+            }
+        }
+        std::process::exit(130); // SIGINT の標準的な終了コード
+    });
 
     // ffmpeg バイナリが存在するか確認
     let ffmpeg_check = if cfg!(target_os = "windows") {
@@ -76,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // 各 URL を処理
-    for url in args.urls {
+    for url in &args.urls {
         // URL からチャンネル名と動画 ID を抽出
         let caps = site_regex.captures(&url).ok_or("Invalid URL format")?;
         let channel_name = caps
@@ -90,8 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let channel_id = client.load_channel_id(channel_name).await?;
 
         if let Some(vid) = video_id {
-            // ===== 単一の動画をダウンロード =====
-            match client.download_video(vid, &args.output_dir).await {
+            match download(&mut client, &args, vid).await {
                 Ok(_) => info!("Successfully downloaded video {}", vid),
                 Err(e) => {
                     if let Some(_) = e.downcast_ref::<NicoChannelError>() {
@@ -130,8 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_str()
                     .ok_or("Failed to get content_code from video")?;
 
-                // 動画をダウンロード
-                match client.download_video(content_code, &args.output_dir).await {
+                match download(&mut client, &args, content_code).await {
                     Ok(_) => info!("Successfully downloaded video {}", content_code),
                     Err(e) => {
                         // ファイルが既に存在する場合の処理
