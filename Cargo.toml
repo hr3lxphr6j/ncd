@@ -1,0 +1,26 @@
+[package]
+name = "ncd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+backoff = {version = "0.4.0",features = ["tokio","futures"]}
+kdam = "0.6.3"
+m3u8-rs = "6.0.0"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3.31"
+thiserror = "2.0.17"
+log = "0.4.29"
+aes = "0.8.4"
+cbc = "0.1"
+cipher = "0.4.4"
+hex = "0.4.3"
+serde_json = "1.0"
+tempfile = "3"
+lazy_static = "1.5.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+filetime = "0.2"
+clap = { version = "4", features = ["derive"] }
+regex = "1.10"
+env_logger = "0.11"
