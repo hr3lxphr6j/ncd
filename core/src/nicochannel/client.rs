@@ -2,20 +2,24 @@
 //!
 //! nicochannel.jp API との相互作用を担当し、以下を含む：
 //! - チャンネル情報の取得
-//! - 動画リストと詳細の取得
-//! - HLS ストリーム URL の取得
+//! - 動画リストの取得（一括 `video_pages` または遅延ストリーム `video_iter`）
+//! - 動画詳細情報と HLS ストリーム URL の取得
 //! - 動画のダウンロードとメタデータ・サムネイルの埋め込み
 
-use crate::hls::HLSDownloader;
+use crate::hls::{HLSDownloader, HlsProgress};
 use crate::httpx::HttpXClient;
 use crate::utils::FileNameUtils;
+use async_stream::stream;
+use futures_util::Stream;
 use lazy_static::lazy_static;
 use log;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 /// NicoChannel API ベース URL
 const PREFIX: &str = "https://api.nicochannel.jp";
@@ -49,8 +53,18 @@ lazy_static! {
 #[derive(Error, Debug)]
 pub enum NicoChannelError {
     /// ファイルが既に存在
-    #[error("NCD file exist")]
+    #[error("file exist")]
     NCDFileExist,
+
+    /// 指定ページに動画が存在しない（ページネーション終端）
+    #[error("video pages empty")]
+    NCDEmptyPages,
+
+    #[error("httpx error")]
+    HttpX(#[from] crate::httpx::Error),
+
+    #[error("http error")]
+    Http(#[from] reqwest::Error),
 }
 
 /// NicoChannel API クライアント
@@ -145,54 +159,158 @@ impl NicoChannelClient {
         Ok(body["data"]["fanclub_site"].clone())
     }
 
-    /// チャンネルのすべての動画ページを取得（ページネーション対応）
+    /// チャンネル動画の一ページ分を取得（内部用）
+    ///
+    /// `video_pages` および `video_iter` から利用される。
+    ///
+    /// # 引数
+    /// - `channel_id`: チャンネル ID
+    /// - `page`: ページ番号（1 始まり）
+    /// - `page_size`: 1 ページあたりの件数
+    /// - `sort`: ソート指定（例: `-display_date`）
+    ///
+    /// # 戻り値
+    /// 成功時は当該ページの動画 JSON リスト。空ページの場合は `NCDEmptyPages`。
+    pub(crate) async fn video_page(
+        &self,
+        channel_id: i64,
+        page: u32,
+        page_size: u32,
+        sort: &str,
+    ) -> Result<Vec<serde_json::Value>, NicoChannelError> {
+        let url = format!("{}/fc/fanclub_sites/{}/video_pages", PREFIX, channel_id);
+        let fc_site_id = self.fc_site_id().unwrap_or("1".to_string());
+        let sort = sort.to_string();
+        let resp = self
+            .hc
+            .get_with_retry(
+                &url,
+                Some(&move |b| {
+                    b.query(&[
+                        ("page", page.to_string().as_str()),
+                        ("per_page", page_size.to_string().as_str()), // 1ページあたり24個の動画
+                        ("sort", sort.as_str()),                      // 表示日付の降順でソート
+                    ])
+                    .header("Fc_site_id", fc_site_id.as_str())
+                }),
+            )
+            .await?
+            .error_for_status()?;
+        let data: serde_json::Value = resp.json().await?;
+        match data["data"]["video_pages"]["list"].as_array() {
+            Some(list) if !list.is_empty() => Ok(list.to_vec()),
+            _ => Err(NicoChannelError::NCDEmptyPages),
+        }
+    }
+
+    /// チャンネル内の全動画を一括取得（ページネーション自動）
+    ///
+    /// 全ページを順に取得して単一の `Vec` にまとめる。メモリに載る規模でよい場合に使用。
     ///
     /// # 引数
     /// - `channel_id`: チャンネル ID
     ///
     /// # 戻り値
-    /// すべての動画の JSON データリスト（ページネーションは自動処理済み）
+    /// 全動画の JSON リスト（表示日付降順）。空でない限り `NCDEmptyPages` で終端を検知して打ち切り。
     pub async fn video_pages(
         &self,
         channel_id: i64,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
         let mut page = 1;
         let mut videos: Vec<serde_json::Value> = Vec::new();
-        let url = format!("{}/fc/fanclub_sites/{}/video_pages", PREFIX, channel_id);
 
         // すべてのページをループで取得
         loop {
-            let page_str = page.to_string();
-            let fc_site_id = self.fc_site_id().unwrap_or("1".to_string());
-            let resp = self
-                .hc
-                .get_with_retry(
-                    &url,
-                    Some(&move |b| {
-                        b.query(&[
-                            ("page", page_str.as_str()),
-                            ("per_page", "24"),        // 1ページあたり24個の動画
-                            ("sort", "-display_date"), // 表示日付の降順でソート
-                        ])
-                        .header("Fc_site_id", fc_site_id.as_str())
-                    }),
-                )
-                .await?
-                .error_for_status()?;
-
-            let data: serde_json::Value = resp.json().await?;
-            let list = data["data"]["video_pages"]["list"].as_array();
-
-            // 現在のページにデータがない場合、すべてのページを取得完了
-            if list.is_none() || list.unwrap().is_empty() {
-                break;
+            let page_resp = self.video_page(channel_id, page, 24, "-display_date").await;
+            match page_resp {
+                Ok(list) => {
+                    videos.extend(list);
+                    page += 1;
+                }
+                Err(e) => match e {
+                    NicoChannelError::NCDEmptyPages => break,
+                    _ => return Err(Box::new(e)),
+                },
             }
-
-            let list: Vec<serde_json::Value> = list.unwrap().to_vec();
-            videos.extend(list);
-            page += 1;
         }
         Ok(videos)
+    }
+
+    /// チャンネル動画の遅延ストリームを返す（async-stream）
+    ///
+    /// ページ単位で API を呼び出し、動画を一つずつ `yield` する。大量動画でもメモリを抑えられる。
+    /// ソートは表示日付降順（`-display_date`）。
+    ///
+    /// # 引数
+    /// - `channel_id`: チャンネル ID
+    /// - `page_size`: 1 ページあたりの件数
+    ///
+    /// # 戻り値
+    /// `Stream<Item = Result<serde_json::Value, NicoChannelError>>`。ページ取得エラー時はそのエラーを yield して終了。
+    pub fn video_iter(
+        self: Arc<Self>,
+        channel_id: i64,
+        page_size: u32,
+    ) -> impl Stream<Item = Result<serde_json::Value, NicoChannelError>> + Send {
+        let client = self;
+        stream! {
+            let mut page = 1u32;
+            loop {
+                match client
+                    .video_page(channel_id, page, page_size, "-display_date")
+                    .await
+                {
+                    Ok(list) => {
+                        if list.is_empty() {
+                            break;
+                        }
+                        for v in list {
+                            yield Ok(v);
+                        }
+                        page += 1;
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Arc<Mutex<NicoChannelClient>>` 用の遅延ストリーム（main 等で `&mut` とストリームを両立させる場合に使用）
+    ///
+    /// 戻り値の挙動は [`Self::video_iter`] と同じ。
+    pub fn video_iter_mutex(
+        client: Arc<Mutex<NicoChannelClient>>,
+        channel_id: i64,
+        page_size: u32,
+    ) -> impl Stream<Item = Result<serde_json::Value, NicoChannelError>> + Send {
+        stream! {
+            let mut page = 1u32;
+            loop {
+                let list = client
+                    .lock()
+                    .await
+                    .video_page(channel_id, page, page_size, "-display_date")
+                    .await;
+                match list {
+                    Ok(videos) => {
+                        if videos.is_empty() {
+                            break;
+                        }
+                        for v in videos {
+                            yield Ok(v);
+                        }
+                        page += 1;
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// 出力ファイル名を生成
@@ -303,6 +421,17 @@ impl NicoChannelClient {
         video_id: &str,
         download_dir: impl AsRef<OsStr>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.download_video_with_progress(video_id, download_dir, None)
+            .await
+    }
+
+    /// 動画をダウンロード（進捗コールバック付き）
+    pub async fn download_video_with_progress(
+        &mut self,
+        video_id: &str,
+        download_dir: impl AsRef<OsStr>,
+        hls_progress: Option<&dyn HlsProgress>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // ===== ステップ 1: 動画情報と HLS URL を取得 =====
         let video_info = self.video_info(video_id).await?;
         let hls_url = self.get_video_hls_url(video_id).await?;
@@ -391,7 +520,12 @@ impl NicoChannelClient {
         log::info!("Downloading video: {} to {}", title, output_file.display());
 
         self.hls_downloader
-            .download(&hls_url, &output_file, Some(&ffmpeg_args_str))
+            .download_with_progress(
+                &hls_url,
+                &output_file,
+                Some(&ffmpeg_args_str),
+                hls_progress,
+            )
             .await?;
 
         // ファイルのタイムスタンプを設定

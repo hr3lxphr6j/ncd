@@ -4,7 +4,10 @@
 //! HLS (HTTP Live Streaming) プロトコルを使用して動画ストリームをダウンロード
 
 use clap::Parser;
+use futures_util::StreamExt;
+use kdam::{tqdm, BarExt};
 use log::{error, info};
+use ncd::hls::HlsProgress;
 use ncd::nicochannel::client::{NicoChannelClient, NicoChannelError};
 use regex::Regex;
 use std::path::PathBuf;
@@ -25,10 +28,6 @@ struct Args {
     #[arg(short, long)]
     incremental: bool,
 
-    /// 永続化データベースではなくメモリデータベースを使用（未実装）
-    #[arg(long)]
-    no_persistence_db: bool,
-
     /// ダウンロードする URL のリスト
     urls: Vec<String>,
 }
@@ -36,6 +35,70 @@ struct Args {
 lazy_static::lazy_static! {
     // グローバル状態：ダウンロード中のファイルを追跡
     static ref DOWNLOADING_FILES: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+}
+
+struct CliKdamHlsProgress {
+    total_step_cb: Mutex<Option<Box<dyn Fn(usize) + Send + Sync>>>,
+}
+
+impl CliKdamHlsProgress {
+    fn new() -> Self {
+        Self {
+            total_step_cb: Mutex::new(None),
+        }
+    }
+}
+
+impl HlsProgress for CliKdamHlsProgress {
+    fn on_total_len(&self, total: usize) {
+        let total_pb = tqdm!(
+            total = total,
+            desc = "Total",
+            position = 0,
+            leave = true
+        );
+        let total_pb = Arc::new(Mutex::new(total_pb));
+
+        let cb: Box<dyn Fn(usize) + Send + Sync> = Box::new(move |_completed| {
+            if let Ok(mut pb) = total_pb.lock() {
+                pb.update(1).expect("progress update failed");
+                let _ = pb.refresh();
+            }
+        });
+
+        *self.total_step_cb.lock().unwrap() = Some(cb);
+    }
+
+    fn on_total_step(&self, completed: usize) {
+        if let Ok(guard) = self.total_step_cb.lock() {
+            if let Some(cb) = guard.as_ref() {
+                cb(completed);
+            }
+        }
+    }
+
+    fn fragment_progress_callback(
+        &self,
+        fragment_index: usize,
+    ) -> Box<ncd::httpx::ProgressCallback> {
+        let fragment_pb = tqdm!(
+            desc = format!("Fragment: {}", fragment_index + 1),
+            unit = "B",
+            unit_scale = true,
+            position = 1,
+            leave = false
+        );
+        let fragment_pb = Arc::new(Mutex::new(fragment_pb));
+
+        Box::new(move |_, downloaded_size: u64, total_size: u64| {
+            if let Ok(mut pb) = fragment_pb.lock() {
+                if pb.total == 0 {
+                    pb.total = total_size as usize;
+                }
+                let _ = pb.update(downloaded_size as usize);
+            }
+        })
+    }
 }
 
 async fn download(
@@ -66,7 +129,10 @@ async fn download(
     }
 
     // ダウンロード実行
-    let result = nc.download_video(vid, &args.output_dir).await;
+    let progress = CliKdamHlsProgress::new();
+    let result = nc
+        .download_video_with_progress(vid, &args.output_dir, Some(&progress))
+        .await;
 
     // ファイルパスを登録から削除
     {
@@ -172,57 +238,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut client = NicoChannelClient::new();
         let channel_id = client.load_channel_id(channel_name).await?;
 
-        if let Some(vid) = video_id {
-            match download(&mut client, &args, vid).await {
-                Ok(_) => info!("Successfully downloaded video {}", vid),
-                Err(e) => {
-                    if let Some(_) = e.downcast_ref::<NicoChannelError>() {
-                        if args.incremental {
-                            // ファイルが既に存在する場合の処理
-                            info!("File exists, stopping (incremental mode)");
-                            return Ok(());
-                        }
-                    } else {
-                        error!("Error downloading video {}: {}", vid, e);
-                    }
-                }
-            }
-        } else {
-            // ===== チャンネルのすべての動画をダウンロード =====
-            let videos = client.video_pages(channel_id).await?;
-
-            for video in videos {
-                // 動画タイプのみを処理（video_media_type.id == 1）
-                if video["video_media_type"]["id"].as_i64() != Some(1) {
-                    continue;
-                }
-
-                // 動画の権限を確認
-                // delivery_target_id: 1=会員限定, 3=有料限定
-                // 限定動画で無料期間がない場合はスキップ
-                let delivery_target_id = video["video_delivery_target"]["id"].as_i64();
-                if delivery_target_id == Some(1) || delivery_target_id == Some(3) {
-                    if video["video_free_periods"].is_null() {
-                        continue;
-                    }
-                }
-
-                // 動画情報を抽出
-                let content_code = video["content_code"]
-                    .as_str()
-                    .ok_or("Failed to get content_code from video")?;
-
-                match download(&mut client, &args, content_code).await {
-                    Ok(_) => info!("Successfully downloaded video {}", content_code),
+        match video_id {
+            Some(vid) => {
+                match download(&mut client, &args, vid).await {
+                    Ok(_) => info!("Successfully downloaded video {}", vid),
                     Err(e) => {
-                        // ファイルが既に存在する場合の処理
                         if let Some(_) = e.downcast_ref::<NicoChannelError>() {
                             if args.incremental {
+                                // ファイルが既に存在する場合の処理
                                 info!("File exists, stopping (incremental mode)");
                                 return Ok(());
                             }
                         } else {
-                            error!("Error downloading video {}: {}", content_code, e);
+                            error!("Error downloading video {}: {}", vid, e);
+                        }
+                    }
+                }
+            }
+            None => {
+                // ===== チャンネルのすべての動画をダウンロード（video_iter で遅延ストリーム） =====
+                let client = Arc::new(tokio::sync::Mutex::new(client));
+                let stream = NicoChannelClient::video_iter_mutex(client.clone(), channel_id, 24);
+                tokio::pin!(stream);
+
+                while let Some(res) = stream.next().await {
+                    let video = res?;
+
+                    // 動画タイプのみを処理（video_media_type.id == 1）
+                    if video["video_media_type"]["id"].as_i64() != Some(1) {
+                        continue;
+                    }
+
+                    // 動画の権限を確認
+                    // delivery_target_id: 1=会員限定, 3=有料限定
+                    // 限定動画で無料期間がない場合はスキップ
+                    let delivery_target_id = video["video_delivery_target"]["id"].as_i64();
+                    if delivery_target_id == Some(1) || delivery_target_id == Some(3) {
+                        if video["video_free_periods"].is_null() {
+                            continue;
+                        }
+                    }
+
+                    // 動画情報を抽出
+                    let content_code = video["content_code"]
+                        .as_str()
+                        .ok_or("Failed to get content_code from video")?;
+
+                    match download(&mut *client.lock().await, &args, content_code).await {
+                        Ok(_) => info!("Successfully downloaded video {}", content_code),
+                        Err(e) => {
+                            // ファイルが既に存在する場合の処理
+                            if let Some(_) = e.downcast_ref::<NicoChannelError>() {
+                                if args.incremental {
+                                    info!("File exists, stopping (incremental mode)");
+                                    return Ok(());
+                                }
+                            } else {
+                                error!("Error downloading video {}: {}", content_code, e);
+                            }
                         }
                     }
                 }
@@ -232,3 +305,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+

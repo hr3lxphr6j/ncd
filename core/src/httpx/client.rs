@@ -3,8 +3,8 @@
 //! リトライ機構付きの HTTP リクエストとファイルダウンロード機能を提供
 //! nicochannel.jp API に必要なデフォルトヘッダーを自動追加
 
-use backoff::ExponentialBackoff;
 use backoff::future::retry;
+use backoff::ExponentialBackoff;
 use futures_util::TryStreamExt;
 use std::path::Path;
 use thiserror::Error;
@@ -16,7 +16,7 @@ static UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 
 /// ダウンロードエラータイプ
 #[derive(Error, Debug)]
-pub enum DownloadError {
+pub enum Error {
     #[error("io error")]
     Io(#[from] std::io::Error),
 
@@ -127,7 +127,7 @@ impl HttpXClient {
         resume: bool,
         builder_fn: Option<&ReqBuilderCallback>,
         progress: Option<&ProgressCallback>,
-    ) -> Result<(), DownloadError> {
+    ) -> Result<(), Error> {
         let output = output.as_ref();
 
         // ===== 1. レジュームかどうかを判断 =====
@@ -204,7 +204,7 @@ impl HttpXClient {
         resume: bool,
         builder_fn: Option<&ReqBuilderCallback>,
         progress: Option<&ProgressCallback>,
-    ) -> Result<(), DownloadError> {
+    ) -> Result<(), Error> {
         let output = output.as_ref();
         retry(ExponentialBackoff::default(), || async {
             self.download(url, output, resume, builder_fn, progress)

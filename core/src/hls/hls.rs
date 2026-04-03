@@ -7,12 +7,11 @@ use crate::httpx;
 use aes::Aes128;
 use cbc::Decryptor;
 use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-use kdam::{tqdm, BarExt};
 use m3u8_rs;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,13 +30,13 @@ pub struct HLSDownloader {
     hc: Arc<httpx::HttpXClient>,
 }
 
-/// HLS 下载器错误类型
+/// HLS ダウンローダーのエラー型
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("http error")]
     Http(#[from] reqwest::Error),
     #[error("httpx error")]
-    HttpXError(#[from] httpx::DownloadError),
+    HttpXError(#[from] httpx::Error),
     #[error("retry error")]
     RetryError(#[from] backoff::Error<reqwest::Error>),
     #[error("io error")]
@@ -48,6 +47,24 @@ pub enum Error {
     SendError(#[from] tokio_mpsc::error::SendError<Vec<u8>>),
     #[error("join error")]
     JoinError(#[from] JoinError),
+}
+
+/// HLS ダウンロード進捗のコールバック：表示方法は上位層（CLI/GUI）で決定する。
+pub trait HlsProgress: Send + Sync {
+    /// セグメント総数が判明した時点で 1 回呼び出される。
+    fn on_total_len(&self, _total: usize) {}
+
+    /// セグメント完了ごとに呼び出される（`completed` は 1 から増加）。
+    fn on_total_step(&self, _completed: usize) {}
+
+    /// 単一セグメント用の進捗コールバックを生成する。
+    ///
+    /// シグネチャは `httpx::ProgressCallback` と同じ：
+    /// `(chunk_size, downloaded_size, total_size)`。
+    fn fragment_progress_callback(
+        &self,
+        fragment_index: usize,
+    ) -> Box<httpx::ProgressCallback>;
 }
 
 impl HLSDownloader {
@@ -152,37 +169,27 @@ impl HLSDownloader {
     /// - `tx`: 復号化されたデータを送信するための channel 送信側
     /// - `key`: AES キー（セグメントが暗号化されている場合）
     /// - `iv`: 初期化ベクトル（セグメントが暗号化されている場合）
-    /// - `fragment_pb`: セグメントダウンロードのプログレスバー（オプション）
+    /// - `fragment_progress`: セグメントダウンロードの進捗コールバック（任意）
     async fn parse_segment(
         &mut self,
         frag: &m3u8_rs::MediaSegment,
         tx: &tokio_mpsc::Sender<Vec<u8>>,
         key: Option<&[u8; 16]>,
         iv: Option<&[u8; 16]>,
-        fragment_pb: Option<Arc<Mutex<kdam::Bar>>>,
+        fragment_progress: Option<&httpx::ProgressCallback>,
     ) -> Result<(), Error> {
         // セグメントを保存する一時ファイルを作成
         let tmp_file = tempfile::NamedTempFile::new()?;
         let tmp_path = tmp_file.path();
 
-        // プログレスバーを Arc<Mutex<...>> にラップして、クロージャ内で更新可能にする
-        let progress: Option<&httpx::ProgressCallback> = if let Some(pb_arc) = fragment_pb {
-            // クロージャ内で使用するためにクローン
-            let pb_clone = Arc::clone(&pb_arc);
-            Some(&move |_, downloaded_size: u64, total_size: u64| {
-                if let Ok(mut pb) = pb_clone.lock() {
-                    if pb.total == 0 {
-                        pb.total = total_size as usize;
-                    }
-                    let _ = pb.update(downloaded_size as usize);
-                }
-            })
-        } else {
-            None
-        };
-
         self.hc
-            .download_with_retry(&frag.uri.as_str(), tmp_path, true, None, progress)
+            .download_with_retry(
+                &frag.uri.as_str(),
+                tmp_path,
+                true,
+                None,
+                fragment_progress,
+            )
             .await?;
 
         // ダウンロードしたファイルを読み取り
@@ -220,6 +227,7 @@ impl HLSDownloader {
         pl: m3u8_rs::MediaPlaylist,
         output: &Path,
         ffmpeg_args: Option<&[&str]>,
+        progress: Option<&dyn HlsProgress>,
     ) -> Result<(), Error> {
         // ===== ステップ 1: 暗号化キーを取得 =====
         // HLS 標準では、キーは通常最初のセグメントの EXT-X-KEY タグで定義される
@@ -284,27 +292,13 @@ impl HLSDownloader {
             let _ = stdin.shutdown().await;
         });
 
-        // ===== ステップ 5: プログレスバーを作成 =====
-        // 総合プログレスバー：すべてのセグメントのダウンロード進捗を表示
-        let mut total_pb = tqdm!(
-            total = pl.segments.len(),
-            desc = "Total",
-            position = 0,
-            leave = true
-        );
+        // ===== ステップ 5: 進捗（セグメント総数）を通知 =====
+        if let Some(p) = progress {
+            p.on_total_len(pl.segments.len());
+        }
 
         // ===== ステップ 6: すべてのセグメントを走査し、ダウンロード、復号化して送信 =====
         for (idx, f) in pl.segments.iter().enumerate() {
-            // セグメントプログレスバーを作成：現在のセグメントのダウンロード進捗を表示
-            let fragment_pb = tqdm!(
-                desc = format!("Fragment: {}", idx + 1),
-                unit = "B",
-                unit_scale = true,
-                position = 1,
-                leave = false
-            );
-            let fragment_pb = Arc::new(Mutex::new(fragment_pb));
-
             // 現在のセグメントに独自のキーがあるか確認
             // セグメントに独自のキーがある場合、セグメントのキーを使用；それ以外はプレイリストレベルのキーを使用
             let seg_key = if let Some(ref k) = f.key {
@@ -336,21 +330,24 @@ impl HLSDownloader {
                 (key, iv)
             };
 
+            // 単一セグメントの進捗コールバックを作成（表示は上位層に委譲）
+            let fragment_progress_box: Option<Box<httpx::ProgressCallback>> =
+                progress.map(|p| p.fragment_progress_callback(idx));
+
             // セグメントをダウンロード、復号化して送信
             self.parse_segment(
                 f,
                 &tx,
                 seg_key.0.as_ref(),
                 seg_key.1.as_ref(),
-                Some(fragment_pb.clone()),
+                fragment_progress_box.as_deref(),
             )
             .await?;
-            if let Ok(mut pb) = fragment_pb.lock() {
-                pb.refresh().expect("TODO: panic message");
+
+            if let Some(p) = progress {
+                p.on_total_step(idx + 1);
             }
-            total_pb.update(1).expect("TODO: panic message");
         }
-        total_pb.refresh().expect("TODO: panic message");
 
         // ===== ステップ 7: channel を閉じ、すべてのデータの書き込み完了を待機 =====
         drop(tx); // 送信側を閉じ、writer タスクにこれ以上のデータがないことを通知
@@ -382,6 +379,7 @@ impl HLSDownloader {
         mut url: String,
         output: &Path,
         ffmpeg_args: Option<&[&str]>,
+        progress: Option<&dyn HlsProgress>,
     ) -> Result<(), Error> {
         loop {
             // プレイリストをダウンロードして解析
@@ -392,7 +390,9 @@ impl HLSDownloader {
             match pl {
                 // Media Playlist: すべてのセグメントを直接処理
                 m3u8_rs::Playlist::MediaPlaylist(pl) => {
-                    return self.parse_media_playlist(pl, output, ffmpeg_args).await;
+                    return self
+                        .parse_media_playlist(pl, output, ffmpeg_args, progress)
+                        .await;
                 }
                 // Master Playlist: 最高ビットレートのバリアントを選択して続行
                 m3u8_rs::Playlist::MasterPlaylist(mp) => {
@@ -435,7 +435,19 @@ impl HLSDownloader {
         output: P,
         ffmpeg_args: Option<&[&str]>,
     ) -> Result<(), Error> {
-        self.download_playlist(url.to_string(), output.as_ref(), ffmpeg_args)
+        self.download_with_progress(url, output, ffmpeg_args, None)
+            .await
+    }
+
+    /// HLS ストリームをダウンロード（進捗コールバック付き）
+    pub async fn download_with_progress<P: AsRef<Path>>(
+        &mut self,
+        url: &str,
+        output: P,
+        ffmpeg_args: Option<&[&str]>,
+        progress: Option<&dyn HlsProgress>,
+    ) -> Result<(), Error> {
+        self.download_playlist(url.to_string(), output.as_ref(), ffmpeg_args, progress)
             .await
     }
 }
