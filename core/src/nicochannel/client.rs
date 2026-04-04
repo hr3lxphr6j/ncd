@@ -39,7 +39,7 @@ lazy_static! {
 }
 
 lazy_static! {
-    static ref DEFAULT_HEADERS: reqwest::header::HeaderMap = {
+    pub static ref DEFAULT_HEADERS: reqwest::header::HeaderMap = {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("Origin", "https://nicochannel.jp".parse().unwrap());
         headers.insert("Referer", "https://nicochannel.jp/".parse().unwrap());
@@ -73,23 +73,22 @@ pub enum NicoChannelError {
 /// - HTTP リクエスト（リトライ機構付き）
 /// - 動画情報キャッシュ
 /// - HLS ストリームダウンロード
-pub struct NicoChannelClient {
+pub struct NicoChannelClient<'hc> {
     /// HTTP クライアント
-    hc: Arc<HttpXClient>,
+    hc: &'hc HttpXClient,
     /// HLS ダウンローダー
-    hls_downloader: HLSDownloader,
+    hls_downloader: HLSDownloader<'hc>,
     /// 動画情報キャッシュ（重複リクエストを回避）
     cache: HashMap<String, Arc<serde_json::Value>>,
     /// 現在のチャンネル ID（fc_site_id ヘッダーの設定に使用）
     channel_id: Option<i64>,
 }
-impl NicoChannelClient {
+impl<'hc> NicoChannelClient<'hc> {
     /// 新しい NicoChannel クライアントを作成
-    pub fn new() -> Self {
-        let hc = Arc::new(HttpXClient::new(Some(DEFAULT_HEADERS.clone())).unwrap());
+    pub fn new(hc: &'hc HttpXClient) -> Self {
         Self {
-            hc: hc.clone(),
-            hls_downloader: HLSDownloader::new(hc.clone()),
+            hc,
+            hls_downloader: HLSDownloader::new(hc),
             cache: HashMap::new(),
             channel_id: None,
         }
@@ -251,7 +250,7 @@ impl NicoChannelClient {
         self: Arc<Self>,
         channel_id: i64,
         page_size: u32,
-    ) -> impl Stream<Item = Result<serde_json::Value, NicoChannelError>> + Send {
+    ) -> impl Stream<Item = Result<serde_json::Value, NicoChannelError>> + Send + use<'hc> {
         let client = self;
         stream! {
             let mut page = 1u32;
@@ -282,10 +281,10 @@ impl NicoChannelClient {
     ///
     /// 戻り値の挙動は [`Self::video_iter`] と同じ。
     pub fn video_iter_mutex(
-        client: Arc<Mutex<NicoChannelClient>>,
+        client: Arc<Mutex<NicoChannelClient<'_>>>,
         channel_id: i64,
         page_size: u32,
-    ) -> impl Stream<Item = Result<serde_json::Value, NicoChannelError>> + Send {
+    ) -> impl Stream<Item = Result<serde_json::Value, NicoChannelError>> + Send + use<'_> {
         stream! {
             let mut page = 1u32;
             loop {
@@ -520,12 +519,7 @@ impl NicoChannelClient {
         log::info!("Downloading video: {} to {}", title, output_file.display());
 
         self.hls_downloader
-            .download_with_progress(
-                &hls_url,
-                &output_file,
-                Some(&ffmpeg_args_str),
-                hls_progress,
-            )
+            .download_with_progress(&hls_url, &output_file, Some(&ffmpeg_args_str), hls_progress)
             .await?;
 
         // ファイルのタイムスタンプを設定

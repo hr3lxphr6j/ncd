@@ -11,7 +11,6 @@ use m3u8_rs;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,9 +24,9 @@ use tokio::task::JoinError;
 /// - Master Playlist と Media Playlist の解析
 /// - AES-128 暗号化セグメントの復号化
 /// - FFmpeg へのストリーミング転送によるパッケージング
-pub struct HLSDownloader {
+pub struct HLSDownloader<'hc> {
     /// HTTP クライアント
-    hc: Arc<httpx::HttpXClient>,
+    hc: &'hc httpx::HttpXClient,
 }
 
 /// HLS ダウンローダーのエラー型
@@ -61,15 +60,12 @@ pub trait HlsProgress: Send + Sync {
     ///
     /// シグネチャは `httpx::ProgressCallback` と同じ：
     /// `(chunk_size, downloaded_size, total_size)`。
-    fn fragment_progress_callback(
-        &self,
-        fragment_index: usize,
-    ) -> Box<httpx::ProgressCallback>;
+    fn fragment_progress_callback(&self, fragment_index: usize) -> Box<httpx::ProgressCallback>;
 }
 
-impl HLSDownloader {
+impl<'hc> HLSDownloader<'hc> {
     /// 新しい HLS ダウンローダーを作成
-    pub fn new(hc: Arc<httpx::HttpXClient>) -> Self {
+    pub fn new(hc: &'hc httpx::HttpXClient) -> Self {
         Self { hc }
     }
 
@@ -183,13 +179,7 @@ impl HLSDownloader {
         let tmp_path = tmp_file.path();
 
         self.hc
-            .download_with_retry(
-                &frag.uri.as_str(),
-                tmp_path,
-                true,
-                None,
-                fragment_progress,
-            )
+            .download_with_retry(&frag.uri.as_str(), tmp_path, true, None, fragment_progress)
             .await?;
 
         // ダウンロードしたファイルを読み取り

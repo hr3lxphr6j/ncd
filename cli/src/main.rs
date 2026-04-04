@@ -8,7 +8,8 @@ use futures_util::StreamExt;
 use kdam::{tqdm, BarExt};
 use log::{error, info};
 use ncd::hls::HlsProgress;
-use ncd::nicochannel::client::{NicoChannelClient, NicoChannelError};
+use ncd::httpx::HttpXClient;
+use ncd::nicochannel::{NicoChannelClient, NicoChannelError, DEFAULT_HEADERS};
 use regex::Regex;
 use std::path::PathBuf;
 use std::process::Command;
@@ -51,12 +52,7 @@ impl CliKdamHlsProgress {
 
 impl HlsProgress for CliKdamHlsProgress {
     fn on_total_len(&self, total: usize) {
-        let total_pb = tqdm!(
-            total = total,
-            desc = "Total",
-            position = 0,
-            leave = true
-        );
+        let total_pb = tqdm!(total = total, desc = "Total", position = 0, leave = true);
         let total_pb = Arc::new(Mutex::new(total_pb));
 
         let cb: Box<dyn Fn(usize) + Send + Sync> = Box::new(move |_completed| {
@@ -102,7 +98,7 @@ impl HlsProgress for CliKdamHlsProgress {
 }
 
 async fn download(
-    nc: &mut NicoChannelClient,
+    nc: &mut NicoChannelClient<'_>,
     args: &Args,
     vid: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -224,6 +220,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         r"https?://nicochannel.jp/(?P<channel_name>[^/]*)/?(?:video/(?P<video_id>\w*))?",
     )?;
 
+    let hc = HttpXClient::new(Some(DEFAULT_HEADERS.clone()))?;
+
     // 各 URL を処理
     for url in &args.urls {
         // URL からチャンネル名と動画 ID を抽出
@@ -235,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let video_id = caps.name("video_id").map(|m| m.as_str());
 
         // クライアントを作成し、チャンネル ID を読み込む
-        let mut client = NicoChannelClient::new();
+        let mut client = NicoChannelClient::new(&hc);
         let channel_id = client.load_channel_id(channel_name).await?;
 
         match video_id {
@@ -305,4 +303,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
